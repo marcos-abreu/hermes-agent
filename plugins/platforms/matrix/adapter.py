@@ -395,6 +395,47 @@ _STARTUP_GRACE_SECONDS = 5  # ignore messages older than this many seconds befor
 
 _OUTBOUND_MENTION_RE = re.compile(r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)")
 
+# Hermes provenance metadata. Marks event payloads emitted by Hermes so receiving
+# Hermes instances can apply loop-prevention policy — not an authenticated bot
+# identity and not an authorization mechanism.
+_HERMES_MATRIX_METADATA_KEY = "com.nousresearch.hermes"
+_HERMES_MATRIX_ORIGIN = "hermes-agent"
+_HERMES_MATRIX_IMPLEMENTED_PROTOCOL = 1
+
+
+def _hermes_matrix_metadata() -> Dict[str, Any]:
+    """Return provenance metadata for events emitted by Hermes.
+
+    This identifies Hermes provenance. It is not an authenticated Matrix
+    bot identity and must not be used as an authorization mechanism.
+    """
+    return {
+        "origin": _HERMES_MATRIX_ORIGIN,
+        "protocol": _HERMES_MATRIX_IMPLEMENTED_PROTOCOL,
+    }
+
+
+def _mark_hermes_matrix_content(content: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach Hermes provenance to an outbound Matrix event content payload."""
+    content.setdefault(_HERMES_MATRIX_METADATA_KEY, _hermes_matrix_metadata())
+    return content
+
+
+def _is_hermes_matrix_content(content: Any) -> bool:
+    """Return whether content carries a recognized Hermes provenance marker."""
+    if not isinstance(content, dict):
+        return False
+
+    metadata = content.get(_HERMES_MATRIX_METADATA_KEY)
+    if not isinstance(metadata, dict):
+        return False
+    protocol = metadata.get("protocol", 0)
+    return (
+        metadata.get("origin") == _HERMES_MATRIX_ORIGIN
+        and isinstance(protocol, int) and not isinstance(protocol, bool)
+        and protocol >= _HERMES_MATRIX_IMPLEMENTED_PROTOCOL
+    )
+
 _E2EE_INSTALL_HINT = "Install with: pip install 'mautrix[encryption]' asyncpg aiosqlite  (requires libolm C library)"
 
 _MATRIX_IMAGE_FILENAME_EXTS = frozenset({
@@ -872,6 +913,8 @@ class MatrixAdapter(BasePlatformAdapter):
         raw_session_scope = str(_extra_or_secret(config.extra, "session_scope", "MATRIX_SESSION_SCOPE", "auto")).strip().lower()
         self._matrix_session_scope = raw_session_scope if raw_session_scope in {"auto", "room", "thread"} else "auto"
         self._process_notices: bool = self._extra_truthy(config, "process_notices", "MATRIX_PROCESS_NOTICES", "false")
+        self._hermes_messages_require_mention: bool = self._extra_truthy(
+            config, "hermes_messages_require_mention", "MATRIX_HERMES_MESSAGES_REQUIRE_MENTION", "false")
         self._reactions_enabled: bool = str(_extra_or_secret(config.extra, "reactions", "MATRIX_REACTIONS", "true")).lower() not in {"false", "0", "no"}
         self._pending_reactions: dict[tuple[str, str], str] = {}
         # Let the final message land before redacting reactions ("missing event" in some
@@ -1407,11 +1450,37 @@ class MatrixAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=str(retry_exc))
         return SendResult(success=True, message_id=last_event_id)
 
+    async def _send_matrix_event(
+        self,
+        room_id: str,
+        event_type: Any,
+        content: Dict[str, Any],
+        timeout: int | None = None,
+    ) -> str:
+        """Send an outbound Matrix event with Hermes provenance metadata.
+
+        Metadata is added to events whose content is controlled by Hermes.
+        Redactions, receipts, typing updates, and similar operations use
+        separate Matrix APIs and do not have a message-content payload here.
+        """
+        _mark_hermes_matrix_content(content)
+
+        operation = self._client.send_message_event(
+            RoomID(room_id),
+            event_type,
+            content,
+        )
+
+        if timeout is None:
+            event_id = await operation
+        else:
+            event_id = await asyncio.wait_for(operation, timeout=timeout)
+
+        return str(event_id)
+
     async def _send_room_message(self, chat_id: str, msg_content: Dict[str, Any]) -> str:
         """Send one m.room.message event (45s cap) and return its event ID as str."""
-        event_id = await asyncio.wait_for(
-            self._client.send_message_event(RoomID(chat_id), EventType.ROOM_MESSAGE, msg_content), timeout=45)
-        return str(event_id)
+        return await self._send_matrix_event(chat_id, EventType.ROOM_MESSAGE, msg_content, timeout=45)
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Post a seed message and return its ``event_id`` as the handoff ``thread_id``. Matrix has
@@ -1456,6 +1525,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 "allowed_user_count": len(self._allowed_user_ids), "allowed_room_count": len(self._allowed_room_ids),
                 "ignored_user_pattern_count": len(self._ignored_user_patterns),
                 "require_mention": self._require_mention, "free_response_room_count": len(self._free_rooms),
+                "hermes_messages_require_mention": self._hermes_messages_require_mention,
                 "allow_room_mentions": self._allow_room_mentions, "process_notices": self._process_notices,
                 "allow_public_rooms": _env_truthy("MATRIX_ALLOW_PUBLIC_ROOMS")},
             "media": {"max_media_bytes": self._max_media_bytes}}
@@ -1793,10 +1863,10 @@ class MatrixAdapter(BasePlatformAdapter):
             success=False, error=f"Media file exceeds Matrix limit ({size} > {self._max_media_bytes} bytes)")
 
     async def _send_content_event(self, room_id: str, msg_content: Dict[str, Any]) -> SendResult:
-        """Send a prebuilt m.room.message payload, mapping exceptions to SendResult."""
+        """Send a prebuilt m.room.message payload with Hermes provenance, mapping exceptions to SendResult."""
         try:
-            event_id = await self._client.send_message_event(RoomID(room_id), EventType.ROOM_MESSAGE, msg_content)
-            return SendResult(success=True, message_id=str(event_id))
+            event_id = await self._send_matrix_event(room_id, EventType.ROOM_MESSAGE, msg_content)
+            return SendResult(success=True, message_id=event_id)
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
 
@@ -1911,6 +1981,44 @@ class MatrixAdapter(BasePlatformAdapter):
         localpart = (sender or "").strip().lstrip("@").partition(":")[0]
         return not localpart or localpart.startswith("_")
 
+    async def _should_process_hermes_originated_message(
+        self,
+        sender: str,
+        body: str,
+        source_content: dict,
+        room_id: str = "",
+        event_id: str = "",
+    ) -> bool:
+        """Apply the Hermes-originated message loop policy.
+
+        This gate applies to text and media messages, including DMs. Human
+        messages are unaffected because they do not carry Hermes provenance.
+        """
+        if not self._hermes_messages_require_mention:
+            return True
+
+        if not _is_hermes_matrix_content(source_content):
+            return True
+
+        mentions_block = source_content.get("m.mentions") or {}
+        mention_user_ids = (
+            mentions_block.get("user_ids")
+            if isinstance(mentions_block, dict)
+            else None
+        )
+
+        # Check if our own id is mentioned.
+        if mention_user_ids and self._user_id and self._user_id in mention_user_ids:
+            return True
+
+        logger.info(
+            "Matrix: dropped Hermes-provenance message from %s in %s: no mention (event %s)",
+            sender,
+            room_id,
+            event_id,
+        )
+        return False
+
     async def _is_allowed_matrix_room_event(self, room_id: str) -> bool:
         """MATRIX_ALLOWED_ROOMS gate; DMs are exempt so personal chats survive a project allowlist."""
         if not self._allowed_room_ids or room_id in self._allowed_room_ids:
@@ -1999,6 +2107,15 @@ class MatrixAdapter(BasePlatformAdapter):
         # m.notice is the conventional bot-response msgtype; ignoring it prevents bot-to-bot loops.
         if msgtype == "m.notice" and not self._process_notices:
             return
+        # Apply the Hermes provenance loop gate to conversational message types.
+        # This includes ordinary m.text messages and media captions. It also
+        # applies in DMs, where MATRIX_REQUIRE_MENTION intentionally does not.
+        if msgtype in ("m.text", "m.notice", "m.image", "m.audio", "m.video", "m.file"):
+            body = source_content.get("body", "") or ""
+            if not await self._should_process_hermes_originated_message(
+                sender, body, source_content, room_id, event_id,
+            ):
+                return
         if msgtype in ("m.image", "m.audio", "m.video", "m.file"):
             await self._handle_media_message(room_id, sender, event_id, event_ts, source_content, relates_to, msgtype)
         elif msgtype in ("m.text", "m.notice"):
@@ -2281,14 +2398,26 @@ class MatrixAdapter(BasePlatformAdapter):
             self._schedule_invite_join(str(room_id))
 
     async def _send_reaction(self, room_id: str, event_id: str, emoji: str) -> Optional[str]:
-        """Send an emoji reaction; returns the reaction event_id, or None on failure."""
+        """Send an Hermes-originated Matrix reaction."""
         if not self._client:
             return None
-        content = {"m.relates_to": {"rel_type": "m.annotation", "event_id": event_id, "key": emoji}}
+
+        content = {
+            "m.relates_to": {
+                "rel_type": "m.annotation",
+                "event_id": event_id,
+                "key": emoji,
+            }
+        }
+
         try:
-            resp_event_id = await self._client.send_message_event(RoomID(room_id), EventType.REACTION, content)
+            resp_event_id = await self._send_matrix_event(
+                room_id,
+                EventType.REACTION,
+                content,
+            )
             logger.debug("Matrix: sent reaction %s to %s", emoji, event_id)
-            return str(resp_event_id)
+            return resp_event_id
         except Exception as exc:
             logger.debug("Matrix: reaction send error: %s", exc)
             return None
@@ -2943,7 +3072,7 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
         from urllib.parse import quote
         url = f"{homeserver}/_matrix/client/v3/rooms/{quote(chat_id, safe='')}/send/m.room.message/{txn_id}"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        payload = {"msgtype": "m.text", "body": message}
+        payload = _mark_hermes_matrix_content({"msgtype": "m.text", "body": message})
         with suppress(ImportError):
             import markdown as _md
             tokenized, tex_store = _latex_to_tokens(message)
@@ -3036,6 +3165,7 @@ def interactive_setup() -> None:
 
 _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
     ("require_mention", "MATRIX_REQUIRE_MENTION", "lower"), ("process_notices", "MATRIX_PROCESS_NOTICES", "lower"),
+    ("hermes_messages_require_mention", "MATRIX_HERMES_MESSAGES_REQUIRE_MENTION", "lower"),
     ("session_scope", "MATRIX_SESSION_SCOPE", "lower"), ("auto_thread", "MATRIX_AUTO_THREAD", "lower"),
     ("dm_mention_threads", "MATRIX_DM_MENTION_THREADS", "lower"),
     ("allowed_users", "MATRIX_ALLOWED_USERS", "csv"), ("free_response_rooms", "MATRIX_FREE_RESPONSE_ROOMS", "csv"),

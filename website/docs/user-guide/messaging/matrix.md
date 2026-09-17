@@ -110,6 +110,8 @@ MATRIX_ALLOWED_ROOMS=!abc123:matrix.org
 MATRIX_FREE_RESPONSE_ROOMS=!abc123:matrix.org,!def456:matrix.org
 MATRIX_IGNORE_USER_PATTERNS='^@telegram_,^@whatsapp_'
 MATRIX_PROCESS_NOTICES=false
+# Loop-prevention: Hermes-originated text/media must @mention this bot (rooms and DMs).
+MATRIX_HERMES_MESSAGES_REQUIRE_MENTION=true
 MATRIX_SESSION_SCOPE=room       # recommended for stable project-room context
 MATRIX_AUTO_THREAD=true
 MATRIX_DM_MENTION_THREADS=false
