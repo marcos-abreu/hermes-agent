@@ -2008,7 +2008,7 @@ class MatrixAdapter(BasePlatformAdapter):
         )
 
         # Check if our own id is mentioned.
-        if mention_user_ids and self._user_id and self._user_id in mention_user_ids:
+        if self._is_bot_mentioned(body, source_content.get("formatted_body"), mention_user_ids):
             return True
 
         logger.info(
