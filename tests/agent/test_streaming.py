@@ -1120,6 +1120,7 @@ class TestAnthropicStreamCallbacks:
                 type="content_block_start",
                 content_block=SimpleNamespace(type="tool_use", name="terminal"),
             ),
+            SimpleNamespace(type="message_stop"),
         ]
 
         final_message = SimpleNamespace(
@@ -1176,7 +1177,7 @@ class TestAnthropicStreamCallbacks:
         good_stream = MagicMock()
         good_stream.__enter__ = MagicMock(return_value=good_stream)
         good_stream.__exit__ = MagicMock(return_value=False)
-        good_stream.__iter__ = MagicMock(return_value=iter([]))
+        good_stream.__iter__ = MagicMock(return_value=iter([SimpleNamespace(type="message_stop")]))
         good_stream.get_final_message.return_value = final_message
 
         agent._anthropic_client = MagicMock()
@@ -1231,7 +1232,7 @@ class TestAnthropicStreamCallbacks:
         good_stream = MagicMock()
         good_stream.__enter__ = MagicMock(return_value=good_stream)
         good_stream.__exit__ = MagicMock(return_value=False)
-        good_stream.__iter__ = MagicMock(return_value=iter([]))
+        good_stream.__iter__ = MagicMock(return_value=iter([SimpleNamespace(type="message_stop")]))
         good_stream.get_final_message.return_value = repaired_message
 
         seen_tools = []

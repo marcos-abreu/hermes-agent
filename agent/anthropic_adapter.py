@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Iterable
 from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +25,7 @@ from agent.anthropic_endpoints import (
 from agent.anthropic_message_convert import (
     convert_messages_to_anthropic, convert_tools_to_anthropic, normalize_model_name,
 )
+from agent.errors import EmptyStreamError
 
 from hermes_cli import __version__ as _HERMES_VERSION
 
@@ -734,9 +734,12 @@ def _stream_final_message(stream_fn, api_kwargs, log_prefix, on_stream_event, on
         # has given up, so abandon the stream (``with`` closes it) instead of streaming an answer
         # nobody reads.
         # Some SDK versions drop optional message_delta metadata from the final snapshot.
-        # Non-iterable shims (get_final_message-only) skip straight to the snapshot.
+        # The stream must end in message_stop; anything else is a retryable incomplete response.
         stop_details = None
-        for event in (stream if isinstance(stream, Iterable) else ()):
+        saw_message_stop = False
+        for event in stream:
+            if getattr(event, "type", None) == "message_stop":
+                saw_message_stop = True
             if getattr(event, "type", None) == "message_delta":
                 details = getattr(getattr(event, "delta", None), "stop_details", None)
                 if details is not None:
@@ -752,6 +755,10 @@ def _stream_final_message(stream_fn, api_kwargs, log_prefix, on_stream_event, on
                 raise
             except Exception:
                 logger.debug("%son_stream_event callback failed", log_prefix, exc_info=True)
+        if not saw_message_stop:
+            raise EmptyStreamError(
+                "Anthropic Messages stream ended before message_stop (possible upstream stream drop)."
+            )
         message = stream.get_final_message()
         if stop_details is not None:
             message.stop_details = stop_details
