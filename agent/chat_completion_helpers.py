@@ -47,6 +47,7 @@ from agent.message_sanitization import (
     sanitize_outbound_kwargs, strip_images_for_rejecting_model,
 )
 from agent.reasoning_summaries import append_streamed_reasoning_detail, separate_glued_reasoning_blocks
+from agent.repetition_guard import is_repetition_dominated
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool_lifecycle import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
@@ -1164,7 +1165,11 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     est_tokens = estimate_request_context_tokens(api_kwargs)
     effort_floor = _high_effort_silence_floor(agent) if codex else 0.0
     codex_floor = 0.0
-    if codex and openai_codex_backend:
+    # Local Responses servers keep their configured local stale/TTFB grace: the hosted
+    # large-context floor, hard ceiling and TTFB scale-up/cap below must not tighten it.
+    base_url = getattr(agent, "base_url", None)
+    local = bool(base_url) and is_local_endpoint(base_url)
+    if codex and not local:
         # Raise the stale floor for large payloads so healthy gateway-scale
         # requests aren't aborted mid-prefill.
         codex_floor = openai_codex_stale_timeout_floor(est_tokens)
@@ -1187,13 +1192,13 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     ttfb_timeout = env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
     if ttfb_timeout <= 0:
         ttfb_enabled = False
-    elif openai_codex_backend:
+    elif codex and not local:
         # Large requests legitimately spend tens of seconds in admission/prefill before the
         # first SSE event: scale the cutoff up to the idle default unless TTFB_STRICT is set.
         disable_above = env_float("HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", 10_000.0)
         strict = os.environ.get("HERMES_CODEX_TTFB_STRICT", "").strip().lower() in {"1", "true", "yes", "on"}
         if not strict and disable_above > 0 and est_tokens >= disable_above and ttfb_timeout < idle_default:
-            logger.info("Scaling openai-codex no-event TTFB watchdog from %.0fs to %.0fs "
+            logger.info("Scaling codex-responses no-event TTFB watchdog from %.0fs to %.0fs "
                 "for large request (context=~%s tokens >= %.0f). "
                 "Set HERMES_CODEX_TTFB_STRICT=1 to keep the smaller cutoff.", ttfb_timeout, idle_default,
                 f"{est_tokens:,}", disable_above)
@@ -1201,11 +1206,11 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
         # Opt-in ceiling (0 = off): a 120s default here silently undid the scale-up above (#91621).
         ttfb_cap = env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 0.0)
         if ttfb_cap > 0 and ttfb_timeout > ttfb_cap:
-            logger.info("Capping openai-codex no-event TTFB timeout from %.0fs to %.0fs "
+            logger.info("Capping codex-responses no-event TTFB timeout from %.0fs to %.0fs "
                 "(context=~%s tokens) per HERMES_CODEX_TTFB_MAX_SECONDS.", ttfb_timeout, ttfb_cap,
                 f"{est_tokens:,}")
             ttfb_timeout = ttfb_cap
-    elif not ttfb_explicit and (base_url := getattr(agent, "base_url", None)) and is_local_endpoint(base_url):
+    elif not ttfb_explicit and local:
         # A local server prefills for minutes before its first event; the chat-completions
         # siblings already grant local endpoints the local stale ceiling, so the Responses
         # transport gets the same grace instead of the 120s hosted cutoff (#92302).
@@ -2249,7 +2254,10 @@ def _codex_summary_attempt(agent, api_messages: list, api_request_id: str):
         codex_kwargs.pop("tools", None)
         codex_kwargs.pop("tool_choice", None)
         codex_kwargs.pop("parallel_tool_calls", None)
-        return _summary_text(agent, agent._run_codex_stream(codex_kwargs))
+        # Route through the same seam as normal Codex turns: a direct _run_codex_stream
+        # bypasses the stale/TTFB watchdogs, interrupt handling and client cleanup, so an
+        # unattended cron summary could wedge forever (#70943).
+        return _summary_text(agent, agent._interruptible_api_call(codex_kwargs))
     return _attempt
 
 
@@ -2365,7 +2373,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, usage_obj, *,
-    dropped_tool_names=None, overflow_terminal=False):
+    dropped_tool_names=None, overflow_terminal=False, api_mode=None):
     """Stub for an SSE stream that ended without ``finish_reason`` after
     delivering content. Tagged ``PARTIAL_STREAM_STUB_ID`` + ``FINISH_REASON_LENGTH``
     so the loop enters its continuation/retry path instead of accepting
@@ -2375,7 +2383,26 @@ def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, u
     context-overflow error. Seeding the recovered text as a continuation stub
     would grow every later request into the same overflow (#106260); the loop
     treats the marker as terminal and ends the turn via the recovery contract.
+
+    ``api_mode="anthropic_messages"`` returns a Messages-shaped stub (``content``
+    block list + ``stop_reason="max_tokens"``) so AnthropicTransport validates it
+    and the loop continues instead of entering the invalid-response retry ladder
+    (#45908). Empty content keeps one empty text block: validate_response rejects
+    an empty list for ``max_tokens``.
     """
+    if api_mode == "anthropic_messages":
+        return SimpleNamespace(
+            id=PARTIAL_STREAM_STUB_ID,
+            type="message",
+            role=role,
+            model=model_name,
+            content=[SimpleNamespace(type="text", text=full_content or "")],
+            stop_reason="max_tokens",
+            stop_sequence=None,
+            usage=usage_obj,
+            _dropped_tool_names=dropped_tool_names or None,
+            _overflow_terminal=overflow_terminal,
+        )
     return SimpleNamespace(
         id=PARTIAL_STREAM_STUB_ID,
         model=model_name,
@@ -3223,6 +3250,14 @@ class _StreamingCall(StreamingWaitMonitor):
                         arguments = repaired
                     else:
                         has_truncated_tool_args = True
+                # Parseable JSON does not prove that a dropped stream completed its
+                # action. Treat degenerate argument loops as partial calls too.
+                # A provider-confirmed call may legitimately write repetitive data.
+                if finish_reason is None and is_repetition_dominated(arguments):
+                    logger.warning(
+                        "Tool call '%s' has repetition-dominated arguments without a "
+                        "finish_reason; treating as a dropped tool call.", tc["function"]["name"] or "?")
+                    has_truncated_tool_args = True
             elif finish_reason is None:
                 # Name arrived, zero arg bytes, no finish_reason: unflagged this
                 # becomes a "stop" turn executing "{}" with no retry.
@@ -3241,6 +3276,12 @@ class _StreamingCall(StreamingWaitMonitor):
         args or stamping "stop"."""
         full_content = "".join(content_parts) or None
         full_reasoning = "".join(reasoning_parts) or None
+        if not full_reasoning and full_content:
+            # Inline-reasoning providers (MiniMax-M3 streams <think>…</think> in content) send no
+            # reasoning delta; fill the structured field from the raw content (#89647).
+            from agent.agent_runtime_helpers import extract_reasoning
+
+            full_reasoning = extract_reasoning(self.agent, SimpleNamespace(content=full_content))
         mock_tool_calls, has_truncated_tool_args = self._assemble_tool_calls(tool_calls_acc, finish_reason)
         # Zero-chunk guard: nothing usable = upstream error / malformed SSE.
         if finish_reason is None and not content_parts and not reasoning_parts and not refusal_parts and not tool_calls_acc:
@@ -3324,7 +3365,7 @@ class _StreamingCall(StreamingWaitMonitor):
         base_final_message = None
 
         from agent import relay_llm
-        from agent.anthropic_adapter import sanitize_anthropic_kwargs
+        from agent.anthropic_adapter import normalize_stream_usage, sanitize_anthropic_kwargs
         accumulator = relay_llm.AnthropicStreamAccumulator()
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
@@ -3332,7 +3373,7 @@ class _StreamingCall(StreamingWaitMonitor):
             sanitize_anthropic_kwargs(final_kwargs, log_prefix=getattr(self.agent, "log_prefix", ""))
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
-            return manager.__enter__()
+            return normalize_stream_usage(manager.__enter__())
 
         def _anthropic_stream_created(raw_stream: Any) -> None:
             _stream_context["stream"] = raw_stream
@@ -3430,7 +3471,8 @@ class _StreamingCall(StreamingWaitMonitor):
     def _maybe_disable_streaming(self, e) -> None:
         """Flip to non-streaming for failures streaming itself cannot survive, or that
         re-streaming can only repeat: the provider rejecting streams outright,
-        AnthropicBedrock IAM lacking InvokeModelWithResponseStream, or a gateway answering
+        AnthropicBedrock IAM lacking InvokeModelWithResponseStream, a custom anthropic_messages
+        provider emitting SSE events out of order (#72833), or a gateway answering
         with contentless SSE keepalive frames (a degraded gateway answers every
         streaming request that way, so the retry must change channel to make progress)."""
         if _is_provider_stream_empty_frame_error(e):
@@ -3446,23 +3488,32 @@ class _StreamingCall(StreamingWaitMonitor):
                 "⚠️ Provider stream returned an empty keepalive frame — retrying this turn "
                 "without streaming (streaming stays off for this session).")
             return
+        from agent.anthropic_adapter import _is_stream_unavailable_error
+        if not _is_stream_unavailable_error(e):
+            return
         _err_lower = str(e).lower()
         _is_stream_unsupported = "stream" in _err_lower and "not supported" in _err_lower
-        _is_bedrock_stream_denied = False
-        if not _is_stream_unsupported and "invokemodelwithresponsestream" in _err_lower:
-            # Message pre-check first: importing bedrock_adapter triggers a lazy boto3 install.
-            from agent.bedrock_adapter import is_streaming_access_denied_error
-            _is_bedrock_stream_denied = is_streaming_access_denied_error(e)
-        if _is_stream_unsupported or _is_bedrock_stream_denied:
+        if "unexpected event order" in _err_lower and not _is_stream_unsupported:
+            # Custom anthropic_messages SSE out of order (#72833): re-streaming repeats it.
+            # Bedrock keeps turn_recovery's sticky Converse switch instead.
+            if self.agent.api_mode != "anthropic_messages" or self.agent.provider == "bedrock":
+                return
             self.agent._disable_streaming = True
             self.agent._safe_print(
-                "\n⚠  AWS IAM denied bedrock:InvokeModelWithResponseStream. Switching to non-streaming.\n"
-                "   Grant that action to restore streaming output.\n"
-                if _is_bedrock_stream_denied else
-                "\n⚠  Streaming is not supported for this model/provider. Switching to non-streaming.\n"
-                "   To avoid this delay, set display.streaming: false in config.yaml\n",
+                "\n⚠  Provider sent Anthropic stream events out of order. Switching to non-streaming.\n",
                 diagnostic=True,
             )
+            return
+        # Remaining matches: stream rejected outright, or Bedrock IAM stream denial.
+        self.agent._disable_streaming = True
+        self.agent._safe_print(
+            "\n⚠  Streaming is not supported for this model/provider. Switching to non-streaming.\n"
+            "   To avoid this delay, set display.streaming: false in config.yaml\n"
+            if _is_stream_unsupported else
+            "\n⚠  AWS IAM denied bedrock:InvokeModelWithResponseStream. Switching to non-streaming.\n"
+            "   Grant that action to restore streaming output.\n",
+            diagnostic=True,
+        )
 
     def _handle_stream_error(self, e: Exception, attempt: int, max_retries: int) -> bool:
         """Classify a failed attempt: True = retry; False = stop with
@@ -3825,6 +3876,7 @@ class _StreamingCall(StreamingWaitMonitor):
             return _build_partial_stream_stub(
                 "assistant", None, None, getattr(self.agent, "model", "unknown"), None,
                 dropped_tool_names=_partial_names, overflow_terminal=True,
+                api_mode=getattr(self.agent, "api_mode", None),
             )
         if not _partial_names:
             logger.warning(
@@ -3832,7 +3884,8 @@ class _StreamingCall(StreamingWaitMonitor):
                 "recovered content so the loop can continue from where the stream died: %s",
                 len(_partial_text or ""), error)
         _stub = _build_partial_stream_stub("assistant", _partial_text, None,
-            getattr(self.agent, "model", "unknown"), None, dropped_tool_names=_partial_names)
+            getattr(self.agent, "model", "unknown"), None, dropped_tool_names=_partial_names,
+            api_mode=getattr(self.agent, "api_mode", None))
         if _cls is not None and _cls.reason == FailoverReason.content_policy_blocked:
             _stub._content_filter_terminated = True
         return _stub
