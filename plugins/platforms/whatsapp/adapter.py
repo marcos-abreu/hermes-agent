@@ -278,8 +278,6 @@ def _terminate_bridge_process(proc, *, force: bool = False) -> None:
                 getattr(child, action)()
         getattr(parent, action)()
 
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
@@ -289,6 +287,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.helpers import cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.helpers import caption_is_command
 from utils import env_int
 
 
@@ -1185,7 +1184,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     cached_urls.append(path)
                     media_types.append(mime)
             media_text_inlined: list[bool] = []
-            if msg_type == MessageType.DOCUMENT and cached_urls:
+            if msg_type == MessageType.DOCUMENT and cached_urls and not caption_is_command(body):
                 body, media_text_inlined = self._inject_document_text(cached_urls, body)
             native_metadata = data.get("nativeMetadata")
             metadata: dict[str, Any] = {k: v for k, v in (
